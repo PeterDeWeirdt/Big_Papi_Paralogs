@@ -15,6 +15,7 @@ library(pheatmap)
 library(RColorBrewer)
 library(ggpubr)
 library(ggrepel)
+
 pkgconfig::set_config("drake::strings_in_dots" = "literals") # New file API
 
 
@@ -67,13 +68,13 @@ plot_lfc <- function(melted, color_var = 'non-targeting') {
   return(p)
 }
 
-get_base_LFC <- function(melted) {
+get_base_LFC <- function(melted, FUN) {
   Base_LFC = melted %>% 
     filter(gene1 == 'non-targeting' |
              gene2 == 'non-targeting') %>%
     mutate(non_control = ifelse(gene1 == 'non-targeting', guide2, guide1)) %>%
     group_by(non_control, Cell, Passage, Vector) %>%
-    summarise(base_LFC = mean(Avg.LFC), n_base = n()) 
+    summarise(base_LFC = FUN(Avg.LFC), n_base = n()) 
   return(Base_LFC)
 }
 
@@ -103,222 +104,108 @@ plot_residuals <- function(modeled_data) {
     base_theme()
 }
 
-summarise_combos <- function(guide_residuals) {
+summarise_combos <- function(guide_residuals, FUN) {
   gene_residuals = guide_residuals %>%
     mutate(temp_gene1 = ifelse(gene1 < gene2, gene1, gene2),
            temp_gene2 = ifelse(gene1 < gene2, gene2, gene1)) %>%
     group_by(temp_gene1, temp_gene2, assay) %>%
     summarise(Cell = first(Cell),
               Passage = first(Passage),
-              Avg.LFC = mean(Avg.LFC),
-              base.Avg.LFC.1 = mean(base_LFC.1), 
-              base.Avg.LFC.2 = mean(base_LFC.2),
-              sum.base.LFC = mean(sum_LFC),
-              mean.residual = mean(residual)) %>%
-    rename(gene1 = temp_gene1, gene2 = temp_gene2) 
+              Combo.LFC = FUN(Avg.LFC),
+              Gene.LFC.1 = FUN(base_LFC.1), 
+              Gene.LFC.2 = FUN(base_LFC.2),
+              Combo.base.LFC = FUN(sum_LFC),
+              Combo.residual = FUN(residual)) %>%
+    rename(gene1 = temp_gene1, gene2 = temp_gene2) %>%
+    ungroup() 
   return(gene_residuals)
 }
 
-interactions_helper <- function(row, i, denom) {
-  # Query the biogrid database for interactions
+generate_pvalues <- function(calculated.values, calc.cols, original.values, orig.cols, my.stat, n.samps,
+                             nboot = 1e4, group.col = 'assay') {
+  # calculated.values: df with (1) statistical values and (2) grouping variable. 
+  # original.values: similaar to calculated.valuess, but not summarised
+  calculated.values = calculated.values %>% select(calc.cols)
+  original.values = original.values %>% select(orig.cols)
+  assays = unique(calculated.values[,2])
+  all_pvals = c()
+  for (curr_assay in assays) {
+    print(curr_assay)
+    values = original.values %>% filter(!!as.name(group.col) == curr_assay) %>% .[,1] %>% unlist()
+    stats = vector(mode = 'numeric', length = nboot)
+    for (i in 1:nboot) {
+      if(i %% 10000 == 0) {print(paste('bootstrap progress:', as.character(i/nboot)))}
+      stats[i] = my.stat(sample(values, n.samps))
+    }
+    
+    calc.stats = calculated.values %>% filter(!!as.name(group.col) == curr_assay) %>% .[,1] %>% unlist()
+    pvals = vector(mode = 'numeric', length = length(calc.stats))
+    for (i in 1:length(pvals)) {
+      pvals[i] = min(sum(calc.stats[i] > stats), sum(calc.stats[i] < stats))/
+        length(stats)
+    }
+    all_pvals = c(pvals, all_pvals)
+  }
+  return(all_pvals)
+}
+
+citations_helper <- function(row, i, denom) {
+  # Query the biogrid database for citations
   # Helpful querrying terms can be found - https://wiki.thebiogrid.org/doku.php/biogridrest
   if (i %% 10 == 0) {print(i/denom)}
-  interactions = read.delim(url(paste('https://webservice.thebiogrid.org/interactions/?searchNames=true&geneList=',
+  citations = read.delim(url(paste('https://webservice.thebiogrid.org/interactions/?searchNames=true&geneList=',
                                       row[[1]],'|',
                                       row[[2]],
-                                      '&taxId=9606&accesskey=ef396dc62ddfc51b05547bf9dd6feb32&includeInteractors=false&includeHeader=true&format=tab2&selfInteractionsExcluded=true', 
+                                      '&taxId=9606&accesskey=ef396dc62ddfc51b05547bf9dd6feb32&includeInteractors=false&includeHeader=true&format=tab2&selfcitationsExcluded=true', 
                                       sep = '')))
-  n = nrow(interactions)
+  n = nrow(citations)
 }
 
 get_interactors <- function(gene_combos) {
-  n_interactions = map_int(1:nrow(gene_combos), 
-                                  function(i) interactions_helper(gene_combos[i,], i, nrow(gene_combos)))
-  gene_combos['interactions'] = n_interactions
+  n_citations = map_int(1:nrow(gene_combos), 
+                                  function(i) citations_helper(gene_combos[i,], i, nrow(gene_combos)))
+  gene_combos['citations'] = n_citations
   return(gene_combos)
 }
 
-auc_helper <- function(ranks, interactions) {
-  positive_ranks = ranks[interactions != 0]
-  negative_ranks = ranks[interactions == 0]
-  pr = pr.curve(positive_ranks, negative_ranks,
-                dg.compute = FALSE)
-  return(pr$auc.integral)
+my_ks <- function(value, condition) {
+  p = ks.test(value[condition > 0], value[condition == 0], alternative = 'two.sided')$p.value
+  return(paste('KS p:', as.character(signif(p, 3))))
 }
 
-get_auc <- function(combo_interactions, score_column) {
-  assay_aucs = combo_interactions %>%
-    group_by(assay) %>%
-    summarise(auc = auc_helper(abs(!!as.name(score_column)), interactions), 
-              random = sum(interactions != 0)/n(),
-              auc.ratio = auc/random)
-}
-
-plot_pr <- function(pr_data, fill = 'assay') {
-  p = ggplot(pr_data) +
-    aes(x = assay, y = auc.ratio, fill = !!as.name(fill)) +
-    geom_bar(position = 'dodge', stat = 'identity', color = 'black') +
-    scale_fill_brewer(palette = 'Set2') +
-    geom_hline(yintercept = 1, linetype = 'dashed') +
+plot_rug <- function(residual_biogrid) {
+  residual_biogrid = ungroup(residual_biogrid)
+  p = ggplot(residual_biogrid) +
+    aes(x = Combo.residual, color = citations > 0) +
+    stat_ecdf() + 
+    facet_wrap('assay') + 
+    geom_rug(sides = 'b') +
+    scale_color_brewer(palette = 'Paired') +
     base_theme() +
-    theme(axis.text.x = element_text(angle = 90)) 
-    
+    geom_text(aes(label = label,  x = m.x, y = m.y, hjust = m.hjust, vjust = m.vjust), 
+              data = residual_biogrid %>%
+                group_by(assay) %>%
+                summarise(label = my_ks(Combo.residual, citations)) %>%
+                mutate(m.x = -Inf, m.y = Inf, m.hjust = -0.1, m.vjust = 1.5),
+              inherit.aes = FALSE)
   return(p)
 }
 
-outlier_helper <- function(gene_data, dominant.guide, secondary.guide) {
-  spread_guides = gene_data %>% 
-    select(!!as.name(dominant.guide), !!as.name(secondary.guide), Avg.LFC) %>%
-    spread(!!as.name(secondary.guide), Avg.LFC) %>%
-    select_if(~ !any(is.na(.))) # If some guides not tested in all conditions
-  spread_mat = as.matrix(spread_guides[,-1])
-  row.names(spread_mat) = spread_guides[[dominant.guide]]
-  spca <- SamplePCA(t(spread_mat))
-  mQC = mahalanobisQC(spca, 2)
-  mQC['guide'] = spread_guides[[dominant.guide]]
-  return(mQC)
-}
-
-calc_outliers <- function(melted_data) {
-  melted_data = melted_data %>% ungroup()
-  assay_list = list()
-  for (cell in (unique(melted_data$Cell))) {
-    cell_data = melted_data %>%
-      filter(Cell == cell)
-    for (passage in unique(cell_data$Passage)) {
-      assay_data = cell_data %>%
-        filter(Passage == passage) 
-      print(paste(cell, passage))
-      gene_list = list()
-      for(curr_gene in unique(assay_data$gene1)) {
-        gene1_outliers = outlier_helper(assay_data %>% 
-                                          filter(gene1 == curr_gene),
-                                        'guide1', 'guide2') %>%
-          mutate(dominant.gene = 'gene1',
-                 curr.gene = curr_gene)
-        gene2_outliers = outlier_helper(assay_data %>% 
-                                          filter(gene2 == curr_gene), 
-                                        'guide2', 'guide1') %>%
-          mutate(dominant.gene = 'gene2',
-                 curr.gene = curr_gene)
-        gene_list[[curr_gene]] = bind_rows(gene1_outliers, gene2_outliers)
-      }
-      assay_list[[paste(cell, passage, sep = '_')]] = bind_rows(gene_list) %>%
-        mutate(Cell = cell, Passage = passage)
-    }
-  }
-  return(bind_rows(assay_list))
-}
-
-join_melted_outliers <-function(all_melted, outliers) {
-  joined = left_join(all_melted, outliers %>% 
-              select(p.value, guide, Cell, Passage) %>%
-              rename(p.value.guide1 = p.value), 
-            by = c('Cell', 'Passage', 'guide1' = 'guide')) %>%
-    left_join(outliers %>% 
-                select(p.value, guide, Cell, Passage) %>%
-                rename(p.value.guide2 = p.value), 
-              by = c('Cell', 'Passage', 'guide2' = 'guide'))
-  return(joined)
-}
-
-call_outliers <- function(melted_outliers, Base_LFC, cutoff) {
-  based_outliers = melted_outliers %>%
-    left_join(Base_LFC, by = c('guide1' = 'non_control', 'Cell', 'Passage', 'Vector')) %>%
-    left_join(Base_LFC, by = c('guide2' = 'non_control', 'Cell', 'Passage', 'Vector'), 
-              suffix = c('.1','.2')) %>%
-    group_by(Cell, Passage, gene1) %>%
-    mutate(gene1.buff = base_LFC.1 > mean(base_LFC.1), 
-           gene1.leth = base_LFC.1 < mean(base_LFC.1)) %>%
-    group_by(Cell, Passage, gene2) %>%
-    mutate(gene2.buff = base_LFC.2 > mean(base_LFC.2), 
-           gene2.leth = base_LFC.2 < mean(base_LFC.2)) %>%
-    group_by(Cell, Passage) %>%
-    mutate(buff.outlier = (gene1.buff & (p.value.guide1 < cutoff)) | 
-             (gene2.buff & (p.value.guide2 < cutoff)), 
-           leth.outlier = (gene1.leth & (p.value.guide1 < cutoff)) | 
-             (gene2.leth & (p.value.guide2 < cutoff))) %>%
-    group_by(Cell, Passage, gene1) %>%
-    mutate(gene1.nonleth.outlier = (p.value.guide1 > cutoff) & (max(gene1.leth & (p.value.guide1 < cutoff)) == 1)) %>%
-    group_by(Cell, Passage, gene2) %>%
-    mutate(gene2.nonleth.outlier = (p.value.guide2 > cutoff) & (max(gene2.leth & (p.value.guide2 < cutoff)) == 1)) %>%
-    mutate(outlier = buff.outlier | gene1.nonleth.outlier | gene2.nonleth.outlier) %>%
-    ungroup()
-  return(based_outliers)
-}
-
-plot_out_base <- function(outliers, base, cutoff) {
-  joined = inner_join(outliers, base, by = c('Cell', 'Passage', 'guide' = 'non_control')) %>%
-    mutate(outlier = p.value < cutoff)
-  ggplot(joined) +
-    aes(x = base_LFC, fill = outlier) +
-    geom_density(alpha = 0.5) +
-    facet_wrap(c('Cell', 'Passage')) +
-    ggtitle(paste('Base LFC distirubtion compared with outliers')) +
-    base_theme() 
-}
-
-plot_hit_heatmaps <- function(residual_df, title) {
-  annotation_df = residual_df %>% 
-    ungroup() %>%
-    mutate(interaction = paste(gene1, gene2, sep = '_'), 
-           biogrid = as.character(interactions > 0)) %>%
-    select(interaction, biogrid) %>%
-    distinct() %>%
-    as.data.frame()
-  interactions = annotation_df$interaction
-  annotation_df = annotation_df %>% select(biogrid)
-  row.names(annotation_df) = interactions
-  
-  spread_df = residual_df %>%
-    mutate(interaction = paste(gene1, gene2, sep = '_')) %>%
-    group_by(assay) %>%
-    mutate(hit =  abs(mean.residual - mean(mean.residual)) > 2*sd(mean.residual)) %>%
-    group_by(interaction) %>%
-    filter(max(hit) == 1) %>%
-    ungroup() %>%
-    select(interaction, assay, mean.residual) %>%
-    spread(assay, mean.residual) 
-  
-  spread_mat = spread_df %>%
-    select(A549_P1, A549_P6, PANC1_P2, PANC1_P6, PANC1_P7) %>%
-    as.matrix()
-  
-  row.names(spread_mat) = spread_df$interaction
-  
-  p = pheatmap(spread_mat,
-           color = colorRampPalette(rev(brewer.pal(n = 7, name =
-                                                     "RdBu")))(100),
-           breaks = c(seq(min(residual_df$mean.residual),0, length.out = 50),
-                      seq(max(residual_df$mean.residual)/100,max(residual_df$mean.residual), length.out = 50)),
-           cutree_cols =2,
-           cutree_rows = 6,
-           border_color = 'black',
-           width = 10, height = 3,
-           cluster_rows = TRUE,
-           annotation_row = annotation_df, 
-           main = title, 
-           annotation_colors = 
-             list(biogrid = c('TRUE' = '#a6cee3',
-                              'FALSE' = 'white')))
-  return(p)
-}
-
-compare_scores <- function(residuals_x, residuals_y, xlabel, ylabel) {
+compare_scores <- function(residuals_x, residuals_y, xlabel, ylabel, p.cut, label_p) {
   joined_residuals = inner_join(residuals_x, residuals_y, 
                                 by = c('gene1', 'gene2', 'assay'), 
                                 suffix = c('.x', '.y')) %>%
-    mutate(biogrid = interactions.x > 0)
+    mutate(biogrid = citations.x > 0)
   subset_data = joined_residuals %>% 
     group_by(assay) %>%
-    summarise(y_min = mean(mean.residual.y) - 2*sd(mean.residual.y), 
-              x_min = mean(mean.residual.x) - 2*sd(mean.residual.x), 
-              y_max = mean(mean.residual.y) + 2*sd(mean.residual.y), 
-              x_max = mean(mean.residual.x) + 2*sd(mean.residual.x))
+    summarise(y_min = max(Combo.residual.y[p.value.y < p.cut & Combo.residual.y < 0]), 
+              x_min = max(Combo.residual.x[p.value.x < p.cut & Combo.residual.x < 0]), 
+              y_max = min(Combo.residual.y[p.value.y < p.cut & Combo.residual.y > 0]), 
+              x_max = min(Combo.residual.x[p.value.x < p.cut & Combo.residual.x > 0]))
     
   
   p = ggplot(joined_residuals) +
-    aes(x = mean.residual.x, y = mean.residual.y) +
+    aes(x = Combo.residual.x, y = Combo.residual.y) +
     facet_wrap('assay') +
     geom_point(aes(color = biogrid)) +
     scale_color_brewer(palette = 'Paired') +
@@ -329,23 +216,70 @@ compare_scores <- function(residuals_x, residuals_y, xlabel, ylabel) {
     geom_hline(data = subset_data, aes(yintercept = y_max), linetype = 'dotted') +
     geom_vline(data = subset_data, aes(xintercept = x_max), linetype = 'dotted') +
     geom_vline(data = subset_data, aes(xintercept = x_min), linetype = 'dotted') +
-    ggtitle('Mean Residuals for Interactions') +
+    ggtitle('Gene residuals') +
+    geom_text_repel(data = joined_residuals %>% filter(gene1 == label_p[1], gene2 == label_p[2], 
+                                                       assay == label_p[3]), 
+                     aes(label = paste(gene1, gene2, sep = '_')), point.padding = 0.5, nudge_y = 0.1,  
+                    min.segment.length = 0, size = 3) +
     stat_cor() 
     
   return(p)
 }
 
-join_interactions <- function(residuals_x, residuals_y, xlabel, ylabel) {
-  joined_residuals = inner_join(residuals_x %>%
-                                  group_by(assay) %>%
-                                  mutate(hit = abs(mean.residual - mean(mean.residual)) > 2*sd(mean.residual)), 
-                                residuals_y %>%
-                                  group_by(assay) %>%
-                                  mutate(hit = abs(mean.residual - mean(mean.residual)) > 2*sd(mean.residual)), 
-                                by = c('gene1', 'gene2', 'assay', 'Cell', 'Passage', 'interactions'), 
-                                suffix = c(xlabel, ylabel))
-  return(joined_residuals)
-    
+visualize_combo <- function(melted, my.gene1, my.gene2, assay, nt = 'non-targeting') {
+  # be sure gene1 and gene2 are alphabetical
+  melted_combo = melted %>% 
+    mutate(temp_gene1 = ifelse(gene1 == nt, gene2, ifelse(gene2 == nt, gene1, ifelse(gene1 < gene2, gene1, gene2))),
+           temp_gene2 = ifelse(gene2 == nt | gene1 == nt, nt, ifelse(gene1 < gene2, gene2, gene1))) %>%
+    select(-gene1, -gene2) %>%
+    rename(gene1 = temp_gene1, 
+           gene2 = temp_gene2) %>%
+    filter(paste(Cell, Passage, sep = '_') == assay &
+             ((gene1 == my.gene1 & gene2 == nt) | 
+                (gene1 == my.gene2 & gene2 == nt) |
+                (gene1 == my.gene1 & gene2 == my.gene2))) %>%
+    mutate(combo = paste(gene1, gene2, sep='_'))
+  p=ggplot(melted_combo) +
+    aes(x = combo, y = Avg.LFC, color = combo) +
+    base_theme() +
+    geom_boxplot(alpha = 0) +
+    geom_point(position = position_dodge(width = 0.7)) +
+    scale_color_brewer(palette = 'Set2') +
+    stat_summary(fun.y = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+                 width = .75, linetype = "dashed") +
+    theme(legend.position = '', axis.text.x = element_text(angle = 45,hjust = 1)) +
+    ggtitle(assay)
+  
+  return(p)
 }
+
+create_heatmap <- function(combo_residuals,p_cut) {
+  signif_combos = combo_residuals %>% 
+    mutate(combo = paste(gene1, gene2, sep = '_')) %>%
+    group_by(assay) %>%
+    group_by(combo) %>%
+    filter(min(p.value) < p_cut)
+  
+  combo_order_df = signif_combos %>% 
+    group_by(combo) %>%
+    summarise(max_abs_resid = Combo.residual[which.max(abs(Combo.residual))]) %>%
+    arrange(-max_abs_resid)
+  
+  assay_order_df = signif_combos %>%
+    group_by(assay) %>%
+    summarise(P = first(Passage)) %>%
+    arrange(P)
+  
+  signif_combos['combo'] = factor(signif_combos$combo, levels = order_df$combo)
+  signif_combos['assay'] = factor(signif_combos$assay, 
+                                  levels = assay_order_df$assay)
+  
+  ggplot(signif_combos) +
+    aes(fill = Combo.residual, x = assay, y = combo) +
+    geom_tile() +
+    base_theme() +
+    scale_fill_viridis(option = 'C') +
+    theme(axis.text.x = element_text(angle = 90))
+ }
 
 

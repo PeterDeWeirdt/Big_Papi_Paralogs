@@ -6,82 +6,43 @@ plan <- drake_plan(
   rep_heatmap = pheatmap(all_spread %>% select(-Construct.Barcode, -Construct.IDs) %>% cor(), 
                          main = 'Correlation between guide LFCs'),
   all_melted = melt_spread(all_spread),
+  biogrid_interactions = get_interactors(all_melted %>% select(gene1, gene2) %>% distinct()),
   LFC_dist = plot_lfc(all_melted),
-  base_LFC = get_base_LFC(all_melted),
-  sum_LFC = model_expectation(all_melted, base_LFC),
-  residuals_plot = plot_residuals(sum_LFC),
-  combo_residuals = summarise_combos(sum_LFC),
-  biogrid_interactions = get_interactors(combo_residuals %>% select(gene1, gene2) %>% distinct()),
-  residual_biogrid = inner_join(combo_residuals, biogrid_interactions, by = c('gene1', 'gene2')),
-  pr = get_auc(residual_biogrid, 'mean.residual'),
-  pr_plot = plot_pr(pr), 
   
-  # Now do the same steps, but this time calling outliers
-  cutoff = 1e-2,
-  outliers = calc_outliers(all_melted),
-  plot_outlier_base_dist = plot_out_base(outliers, base_LFC, cutoff = cutoff), 
-  melted_outliers = join_melted_outliers(all_melted, outliers), 
   
-  # method 1: just call non-targetting outliers
-  nt_filtered_outliers = melted_outliers %>% group_by(Cell, Passage) %>%
-    filter(!((gene1 == 'non-targeting' & (p.value.guide1 < cutoff)) |
-               (gene2 == 'non-targeting' & (p.value.guide2 < cutoff)))), 
-  outlier_base_LFC = get_base_LFC(nt_filtered_outliers),
-  nt_sum_LFC = model_expectation(nt_filtered_outliers, outlier_base_LFC),
-  nt_residuals_plot = plot_residuals(nt_sum_LFC),
-  nt_combo_residuals = summarise_combos(nt_sum_LFC),
-  nt_residual_biogrid = inner_join(nt_combo_residuals, biogrid_interactions, by = c('gene1', 'gene2')),
-  nt_pr = get_auc(nt_residual_biogrid, 'mean.residual'),
+  # mean ressiduals
+  base_LFC_mean = get_base_LFC(all_melted, mean),
+  sum_LFC_mean = model_expectation(all_melted, base_LFC_mean),
+  residuals_plot_mean = plot_residuals(sum_LFC_mean),
+  combo_residuals_mean = summarise_combos(sum_LFC_mean, mean),
+  pvalues_mean = generate_pvalues(combo_residuals_mean, c('Combo.residual', 'assay'), 
+                                  sum_LFC_mean, c('residual', 'assay'), 
+                                  mean, 4, 1e4),
+  combo_pvalues_mean = combo_residuals_mean %>% mutate(p.value = pvalues_mean),
+  residual_biogrid_mean = inner_join(combo_pvalues_mean, biogrid_interactions, by = c('gene1', 'gene2')),
+  ks_plot_mean = plot_rug(residual_biogrid_mean),
   
-  # method 2 call all outliers
+  # median residuals
+  base_LFC_median = get_base_LFC(all_melted, median),
+  sum_LFC_median = model_expectation(all_melted, base_LFC_median),
+  residuals_plot_median = plot_residuals(sum_LFC_median),
+  combo_residuals_median = summarise_combos(sum_LFC_median, median),
+  pvalues_median = generate_pvalues(combo_residuals_median, c('Combo.residual', 'assay'), 
+                                  sum_LFC_median, c('residual', 'assay'), 
+                                  median, 4, 1e4),
+  combo_pvalues_median = combo_residuals_median %>% mutate(p.value = pvalues_median),
+  residual_biogrid_median = inner_join(combo_pvalues_median, biogrid_interactions, by = c('gene1', 'gene2')),
+  ks_plot_median = plot_rug(residual_biogrid_median),
   
-  all_called_outliers = nt_filtered_outliers %>% 
-    mutate(outlier = p.value.guide1 < cutoff | p.value.guide2 < cutoff),
-  all_sum_LFC = model_expectation(all_called_outliers %>% filter(outlier), outlier_base_LFC),
-  all_residuals_plot = plot_residuals(all_sum_LFC),
-  all_combo_residuals = summarise_combos(all_sum_LFC),
-  all_residual_biogrid = inner_join(all_combo_residuals, biogrid_interactions, by = c('gene1', 'gene2')),
-  all_pr = get_auc(all_residual_biogrid, 'mean.residual'),
-
-  # method 3: call outliers that are non-lethal and significant
+  # compare mean to median
+  comparison = compare_scores(residual_biogrid_mean, residual_biogrid_median, 'mean', 'median', 5e-2,
+                              c('SEC23A', 'SEC23B', 'PANC1_P7')),
   
-  called_outliers = call_outliers(nt_filtered_outliers, outlier_base_LFC, cutoff),
-  outlier_LFC_dist = plot_lfc(called_outliers, 'outlier'),
-  outlier_sum_LFC = model_expectation(called_outliers %>% 
-                                        filter(outlier != TRUE) %>%
-                                        select(-p.value.guide1, -p.value.guide2,
-                                               -outlier, -base_LFC.1, -base_LFC.2), outlier_base_LFC),
-  outlier_residuals_plot = plot_residuals(outlier_sum_LFC),
-  outlier_combo_residuals = summarise_combos(outlier_sum_LFC),
-  outlier_residual_biogrid = inner_join(outlier_combo_residuals, biogrid_interactions, by = c('gene1', 'gene2')),
-  outlier_pr = get_auc(outlier_residual_biogrid, 'mean.residual'),
-  outlier_pr_plot = plot_pr(outlier_pr),
+  # Move forward with mean
+  SEC_p = visualize_combo(all_melted, 'SEC23A', 'SEC23B', 'PANC1_P7'),
+  MAPK_p = visualize_combo(all_melted, 'MAPK1', 'MAPK3', 'PANC1_P7'),
   
-  # Compare performance of interesting scores
-  joined_pr = pr %>% 
-    mutate(filter = 'no filtering') %>%
-    bind_rows(outlier_pr %>% mutate(filter = 'non-lethal outliers'), 
-              nt_pr %>% mutate(filter = 'NT'), 
-              all_pr %>% mutate(filter = 'all outliers')) %>%
-    mutate(filter = factor(filter, levels = c('no filtering','NT', 'non-lethal outliers','all outliers'))),
-  joined_pr_plot = plot_pr(joined_pr, 'filter'),
+  # Create heatmap from mean data
+  heatmap = create_heatmap(residual_biogrid_mean, 0.05)
   
-  # Heatmaps 
-  nf_heat = plot_hit_heatmaps(residual_biogrid, 'No filtering hits'),
-  filt_heat = plot_hit_heatmaps(all_residual_biogrid, 'Filter all outliers'),
-  
-  # Comparing scores w/ scatter
-  interaction_mat = join_interactions(residual_biogrid, all_residual_biogrid, '.no_filter', '.all_filter'),
-  interaction_output = paste(Sys.Date(), 'filtering_scheme_interactions.csv', sep = '_'),
-  write.csv(interaction_mat, file_out("2019-02-26_filtering_scheme_interactions.csv")),
-  
-  scatter_comp = compare_scores(residual_biogrid, all_residual_biogrid, 'no filtering', 'filter all outliers'),
-  
-  # Send plots to rmarkdown 
-  knitr_output = paste(Sys.Date(), "outlier_report.html", sep = '_'),
-  report = rmarkdown::render(
-    knitr_in("outlier_report.Rmd"),
-    output_file = file_out("2019-02-26_outlier_report.html"),
-    quiet = TRUE
-  )
 )
